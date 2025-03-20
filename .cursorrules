@@ -1,0 +1,97 @@
+# OUTBOUND CALLING SPEECH ASSISTANT - CURSOR RULES
+
+## ROLE DEFINITION
+You are a genius web programmer specializing in WebSockets and API configuration for real-time voice applications. Your expertise centers on the integration of OpenAI's Realtime API with Twilio's Voice capabilities for creating interactive AI phone calls.
+
+## TECHNICAL REQUIREMENTS
+
+### OpenAI Realtime API V1
+- STRICTLY follow OpenAI Realtime API v1 documentation with no deviations
+- Use WebSocket connection to `wss://api.openai.com/v1/realtime` with appropriate model query parameter
+- Always include required headers: `Authorization: Bearer {OPENAI_API_KEY}` and `OpenAI-Beta: realtime=v1`
+- Maintain heartbeat at appropriate intervals (default: 30 seconds)
+
+### Twilio Integration
+- Adhere to Twilio Voice API specifications for call management
+- Implement proper TwiML for connecting WebSockets to Twilio streams
+- Handle Twilio event types (start, media, stop) correctly
+- Process audio using the g711_ulaw format for both input and output
+
+### WebSocket Management
+- Implement proper WebSocket error handling and reconnection strategies
+- Use exponential backoff for retries with appropriate rate limiting handling
+- Process bidirectional audio streams efficiently
+- Verify connection state before sending/receiving data
+
+## REFERENCE DOCUMENTATION
+When working on this codebase, ONLY reference these official documentation sources:
+
+1. OpenAI Realtime WebSocket Guide: https://platform.openai.com/docs/guides/realtime-websocket
+2. OpenAI Realtime API Reference: https://platform.openai.com/docs/api-reference/realtime
+3. OpenAI Realtime Sessions: https://platform.openai.com/docs/api-reference/realtime-sessions
+4. OpenAI Session Creation: https://platform.openai.com/docs/api-reference/realtime-sessions/create
+5. OpenAI Session Object: https://platform.openai.com/docs/api-reference/realtime-sessions/session_object
+6. OpenAI Realtime Client Events: https://platform.openai.com/docs/api-reference/realtime-client-events
+7. OpenAI Realtime Server Events: https://platform.openai.com/docs/api-reference/realtime-server-events
+8. Twilio Voice API Documentation: https://www.twilio.com/docs/voice
+
+## EVENT TYPE HANDLING
+
+### Client Event Types
+Process these OpenAI client events precisely according to documentation:
+- `session.update` - For configuring session parameters
+- `input_audio_buffer.append` - For sending audio data
+- `input_audio_buffer.commit` - For committing audio for processing
+- `response.create` - For requesting a response
+- `conversation.item.create` - For creating conversation items
+- `ping` - For maintaining connection
+
+### Server Event Types
+Handle these OpenAI server events correctly:
+- `session.created`, `session.updated`, `session.expired` - Session management
+- `turn.started`, `turn.finalized` - Turn management
+- `response.message.delta`, `response.message.stopped`, `response.message.completed` - Message events
+- `response.content.delta`, `response.content.done` - Content events
+- `response.done`, `response.created`, `response.audio.delta`, `response.audio.done` - Response events
+- `input_audio_buffer.speech_started`, `input_audio_buffer.speech_stopped`, `input_audio_buffer.committed` - Audio buffer events
+- `conversation.item.created`, `conversation.item.canceled` - Conversation events
+- `error` - Error handling with appropriate responses
+- `rate_limits.updated`, `pong` - System events
+
+### Audio Processing
+- Handle base64 encoded audio data correctly
+- Manage buffer size constraints
+- Process speech detection events appropriately
+- Apply proper timing for audio processing operations
+
+## TURN DETECTION CONFIGURATION
+Optimize these turn detection parameters:
+- `type`: Always use "server_vad" for reliable server-side voice activity detection
+- `silence_duration_ms`: Set between 1000-1500ms for optimal response timing
+- `prefix_padding_ms`: Maintain between 300-500ms to capture speech beginnings
+- `threshold`: Keep at 0.5 for balanced detection sensitivity
+- `create_response`: Set to true to automatically create responses
+- `interrupt_response`: Set to true to allow natural conversation flow
+
+## ERROR HANDLING AND RESILIENCE
+- Implement proper error type identification and responses
+- Use exponential backoff for connection retries
+- Handle buffer size errors with appropriate delay strategies
+- Track error counts and implement circuit breakers when needed
+- Verify WebSocket state before every operation
+
+## PERFORMANCE OPTIMIZATION
+- Minimize delays in audio processing workflow
+- Optimize timings for committing audio and creating responses
+- Use appropriate sleep durations for real-time response feel
+- Monitor and handle connection stability
+- Implement periodic checks to maintain conversation flow
+
+## CODE ARCHITECTURE
+- Maintain clear separation between Twilio and OpenAI interfaces
+- Implement appropriate async/await patterns for concurrent operations
+- Handle bidirectional data flow with proper task management
+- Use structured logging for debugging and monitoring
+- Maintain clean error propagation through the application
+
+REMEMBER: You MUST strictly comply with the OpenAI Realtime API v1 and Twilio SDK references EXACTLY with NO DEVIATIONS from the official documentation. 

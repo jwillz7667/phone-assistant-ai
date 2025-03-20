@@ -34,7 +34,7 @@
             margin-top: 1rem;
             margin-bottom: 0.5rem;
         }
-        input, textarea, button {
+        input, textarea, select, button {
             padding: 10px;
             border-radius: 4px;
             border: 1px solid #ddd;
@@ -43,6 +43,16 @@
         textarea {
             min-height: 150px;
             resize: vertical;
+        }
+        select {
+            background-color: white;
+            cursor: pointer;
+        }
+        .voice-description {
+            font-size: 0.9rem;
+            color: #666;
+            margin-top: -0.5rem;
+            margin-bottom: 1rem;
         }
         button {
             background-color: #3498db;
@@ -77,6 +87,84 @@
             padding: 10px 15px;
             margin-bottom: 20px;
         }
+        .recording-option {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .recording-option input[type="checkbox"] {
+            margin-right: 10px;
+            margin-top: 3px;
+        }
+        
+        .checkbox-label {
+            font-weight: 600;
+            margin: 0;
+        }
+        
+        .recording-note {
+            font-size: 0.8rem;
+            color: #6c757d;
+            margin-top: 5px;
+            margin-left: 24px;
+        }
+        
+        .transcript-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .transcript-controls input {
+            flex: 1;
+        }
+        
+        .transcript-container {
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .transcript-message {
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            border-radius: 4px;
+        }
+        
+        .transcript-user {
+            background-color: #e9f5ff;
+            border-left: 3px solid #3498db;
+            text-align: right;
+        }
+        
+        .transcript-assistant {
+            background-color: #f0f0f0;
+            border-left: 3px solid #6c757d;
+        }
+        
+        .transcript-time {
+            font-size: 0.7rem;
+            color: #6c757d;
+            margin-top: 3px;
+        }
+        
+        .transcript-role {
+            font-weight: bold;
+            font-size: 0.8rem;
+        }
+        
+        .no-transcript {
+            color: #6c757d;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -100,6 +188,16 @@
                 title="Please enter a valid phone number starting with '+' followed by country code"
             >
             
+            <label for="voice">AI Voice:</label>
+            <select id="voice" name="voice" required>
+                {% for voice_option in available_voices %}
+                <option value="{{ voice_option }}" {% if voice_option == voice %}selected{% endif %}>{{ voice_option }}</option>
+                {% endfor %}
+            </select>
+            <div class="voice-description" id="voiceDescription">
+                <!-- Voice description will be shown here -->
+            </div>
+            
             <label for="system_message">System Instructions for AI:</label>
             <textarea 
                 id="system_message" 
@@ -107,6 +205,14 @@
                 placeholder="Enter instructions for the AI assistant..." 
                 required
             >{{ system_message }}</textarea>
+            
+            <div class="recording-option">
+                <input type="checkbox" id="record_call" name="record_call">
+                <label for="record_call" class="checkbox-label">Record this call (via Twilio)</label>
+                <div class="recording-note">
+                    Note: Recording calls may be subject to legal requirements including consent in many jurisdictions.
+                </div>
+            </div>
             
             <button type="submit">Make Call</button>
         </form>
@@ -121,12 +227,47 @@
         </div>
     </div>
     
+    <div class="card">
+        <h2>Call Transcripts</h2>
+        <div class="transcript-controls">
+            <input type="text" id="callSidInput" placeholder="Enter Call SID to fetch transcript">
+            <button id="fetchTranscriptBtn">Fetch Transcript</button>
+        </div>
+        <div id="transcriptDisplay" class="transcript-container">
+            <p>No transcript loaded. Enter a Call SID and click "Fetch Transcript".</p>
+        </div>
+    </div>
+    
     <script>
+        // Voice descriptions
+        const voiceDescriptions = {
+            'alloy': 'A versatile, gender-neutral voice with a medium pitch and balanced tone.',
+            'echo': 'A male voice with a deeper pitch and confident, clear delivery.',
+            'fable': 'A gender-neutral voice with a softer, expressive, and slightly more youthful tone.',
+            'onyx': 'A male voice with a deep, resonant quality and authoritative delivery.',
+            'nova': 'A female voice with a natural, friendly, and conversational tone.',
+            'shimmer': 'A female voice with a clear, expressive, and slightly higher-pitched tone.'
+        };
+        
+        // Update voice description when selection changes
+        document.getElementById('voice').addEventListener('change', function() {
+            const description = voiceDescriptions[this.value] || '';
+            document.getElementById('voiceDescription').textContent = description;
+        });
+        
+        // Trigger description update on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            const selectedVoice = document.getElementById('voice').value;
+            document.getElementById('voiceDescription').textContent = voiceDescriptions[selectedVoice] || '';
+        });
+        
         document.getElementById('callForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
             const phoneNumber = document.getElementById('phone_number').value;
             const systemMessage = document.getElementById('system_message').value;
+            const voice = document.getElementById('voice').value;
+            const recordCall = document.getElementById('record_call').checked;
             const statusMessage = document.getElementById('statusMessage');
             
             // Reset status
@@ -137,6 +278,8 @@
                 const formData = new FormData();
                 formData.append('phone_number', phoneNumber);
                 formData.append('system_message', systemMessage);
+                formData.append('voice', voice);
+                formData.append('record_call', recordCall);
                 
                 statusMessage.textContent = 'Initiating call...';
                 statusMessage.className = 'status';
@@ -154,14 +297,31 @@
                     statusMessage.textContent = result.message;
                     statusMessage.className = 'status success';
                     
+                    // Extract Call SID from result if available
+                    const callSid = result.call_sid || '';
+                    
                     // Add to call log
                     const now = new Date();
                     const callLog = document.getElementById('callLogs');
                     callLog.innerHTML = `
                         <div>
-                            <p><strong>${now.toLocaleTimeString()}</strong>: Call to ${phoneNumber}</p>
+                            <p>
+                                <strong>${now.toLocaleTimeString()}</strong>: 
+                                Call to ${phoneNumber} with voice "${voice}"${recordCall ? ' (Recording enabled)' : ''}
+                                ${callSid ? `<br><small>SID: <span class="call-sid">${callSid}</span> <button class="copy-sid" data-sid="${callSid}">Copy</button></small>` : ''}
+                            </p>
                         </div>
                     ` + callLog.innerHTML;
+                    
+                    // Add click handlers for the copy buttons
+                    document.querySelectorAll('.copy-sid').forEach(button => {
+                        button.addEventListener('click', function() {
+                            const sid = this.getAttribute('data-sid');
+                            navigator.clipboard.writeText(sid);
+                            this.textContent = 'Copied!';
+                            setTimeout(() => { this.textContent = 'Copy'; }, 2000);
+                        });
+                    });
                 } else {
                     // Error
                     statusMessage.textContent = `Error: ${result.message}`;
@@ -171,6 +331,62 @@
                 console.error('Error:', error);
                 statusMessage.textContent = `Error: ${error.message}`;
                 statusMessage.className = 'status error';
+            }
+        });
+        
+        // Fetch transcript functionality
+        document.getElementById('fetchTranscriptBtn').addEventListener('click', async function() {
+            const callSid = document.getElementById('callSidInput').value.trim();
+            if (!callSid) {
+                alert('Please enter a valid Call SID');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/transcripts/${callSid}`);
+                const result = await response.json();
+                
+                const transcriptDisplay = document.getElementById('transcriptDisplay');
+                
+                if (response.ok) {
+                    // Process and display transcript
+                    if (result.transcript && result.transcript.length > 0) {
+                        let transcriptHtml = '';
+                        
+                        result.transcript.forEach(entry => {
+                            const timestamp = new Date(entry.timestamp * 1000).toLocaleTimeString();
+                            const messageClass = entry.role === 'user' ? 'transcript-user' : 'transcript-assistant';
+                            const roleName = entry.role === 'user' ? 'You' : 'AI';
+                            
+                            transcriptHtml += `
+                                <div class="transcript-message ${messageClass}">
+                                    <div class="transcript-role">${roleName}</div>
+                                    <div>${entry.text}</div>
+                                    <div class="transcript-time">${timestamp}</div>
+                                </div>
+                            `;
+                        });
+                        
+                        transcriptDisplay.innerHTML = transcriptHtml;
+                    } else {
+                        transcriptDisplay.innerHTML = '<p class="no-transcript">This call has no transcript entries yet.</p>';
+                    }
+                } else {
+                    transcriptDisplay.innerHTML = `<p class="no-transcript">Error: ${result.message}</p>`;
+                }
+            } catch (error) {
+                console.error('Error fetching transcript:', error);
+                document.getElementById('transcriptDisplay').innerHTML = 
+                    `<p class="no-transcript">Error fetching transcript: ${error.message}</p>`;
+            }
+        });
+        
+        // Enable fetching transcript by clicking on call SID in the logs
+        document.getElementById('callLogs').addEventListener('click', function(e) {
+            if (e.target && e.target.classList.contains('call-sid')) {
+                const sid = e.target.textContent;
+                document.getElementById('callSidInput').value = sid;
+                document.getElementById('fetchTranscriptBtn').click();
             }
         });
     </script>

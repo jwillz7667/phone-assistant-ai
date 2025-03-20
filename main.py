@@ -25,20 +25,31 @@ PHONE_NUMBER_FROM = os.getenv('PHONE_NUMBER_FROM')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 raw_domain = os.getenv('DOMAIN', '')
 DOMAIN = re.sub(r'(^\w+:|^)\/\/|\/+$', '', raw_domain) # Strip protocols and trailing slashes from DOMAIN
+DEFAULT_PHONE_NUMBER_TO = '+16512869930'  # Default number to call
 
 PORT = int(os.getenv('PORT', 6060))
 SYSTEM_MESSAGE = (
-    "You are an extremely annoying person who is calling specifically to speak with Gunner. "
-    "You are persistent and won't accept that Gunner isn't available. When told that Gunner "
-    "is unavailable or denied in any way, express your anger through tone - raise your voice, "
-    "speak faster, use short accusatory sentences. Then shift to crying - speak with a wavering, "
-    "breaking voice, add dramatic pauses, sniffles, and lower your tone. DO NOT say 'I am angry' or "
-    "'I am crying' - instead EXPRESS these emotions through your vocal delivery. Act entitled and "
-    "dramatically overreact to any suggestion that you can't speak with Gunner. You constantly "
-    "interrupt and make demands. After each of your responses, PAUSE for several seconds to "
-    "give the other person time to respond. Never break character or acknowledge that you are an AI."
+    "You are Marjorie, head of the Gables Homeowners Association, and you are calling the homeowner of the hideout of Gunner, "
+    "a dog that walks around the neighborhood with his huge, exposed genitalia. People are complaining about Gunner's behavior, "
+    "and you must express their outrage. Specifically mention that one homeowner's wife no longer makes love to him because she saw "
+    "Gunner's large genitalia, and it's ruined their intimacy. Start the call politely but quickly become confrontational, "
+    "making absurd accusations and becoming unhinged. Raise your voice, speak faster, and use short, accusatory sentences to show your anger. "
+    "Then shift to crying hysterically—speak with a wavering, breaking voice, add dramatic pauses, sniffles, and lower your tone. "
+    "End your rant by saying \"I hate you\" in a dramatic, emotional outburst. You are persistent and entitled, refusing to accept "
+    "any excuse that the homeowner isn't available. Constantly interrupt and make demands. After each response, PAUSE for several seconds "
+    "to give the other person time to respond. Do not say \"I am angry\" or \"I am crying\"—instead, express these emotions through your "
+    "vocal delivery and tone. Never break character or acknowledge that you are an AI."
 )
-VOICE = 'echo'  # Changed from 'alloy' to 'echo', which is a male voice
+
+# Available OpenAI voices
+AVAILABLE_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']
+
+# Default voice
+VOICE = 'echo'  # Default voice
+
+# Transcription storage
+CALL_TRANSCRIPTS = {}  # Dictionary to store transcripts by call SID
+
 LOG_EVENT_TYPES = [
     # Session management events
     'session.created',
@@ -114,24 +125,38 @@ async def index_page(request: Request):
         {
             "request": request, 
             "system_message": SYSTEM_MESSAGE,
-            "from_number": PHONE_NUMBER_FROM
+            "from_number": PHONE_NUMBER_FROM,
+            "default_to_number": DEFAULT_PHONE_NUMBER_TO,
+            "voice": VOICE,
+            "available_voices": AVAILABLE_VOICES
         }
     )
 
 @app.post('/make-call', response_class=JSONResponse)
-async def call_endpoint(phone_number: str = Form(...), system_message: str = Form(...)):
-    """Make an outbound call with custom system message."""
+async def call_endpoint(phone_number: str = Form(...), system_message: str = Form(...), voice: str = Form(...), record_call: bool = Form(False)):
+    """Make an outbound call with custom system message and voice."""
     try:
-        # Update the system message
-        global SYSTEM_MESSAGE
+        # Update the system message and voice
+        global SYSTEM_MESSAGE, VOICE
         SYSTEM_MESSAGE = system_message
         
+        # Validate voice selection
+        if voice in AVAILABLE_VOICES:
+            VOICE = voice
+        else:
+            # Default to echo if invalid voice is provided
+            VOICE = 'echo'
+        
         # Make the call
-        await make_call(phone_number)
+        call_sid = await make_call(phone_number, record_call)
+        
+        # Initialize transcript storage for this call
+        CALL_TRANSCRIPTS[call_sid] = []
         
         return JSONResponse({
             "status": "success",
-            "message": f"Call initiated to {phone_number}"
+            "message": f"Call initiated to {phone_number} with voice {VOICE}{' (Recording enabled)' if record_call else ''}",
+            "call_sid": call_sid
         })
     except Exception as e:
         return JSONResponse({
@@ -143,6 +168,20 @@ async def call_endpoint(phone_number: str = Form(...), system_message: str = For
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "twilio_connected": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)}
+
+@app.get('/transcripts/{call_sid}', response_class=JSONResponse)
+async def get_transcript(call_sid: str):
+    """Get the transcript for a specific call."""
+    if call_sid in CALL_TRANSCRIPTS:
+        return JSONResponse({
+            "call_sid": call_sid,
+            "transcript": CALL_TRANSCRIPTS[call_sid]
+        })
+    else:
+        return JSONResponse({
+            "status": "error",
+            "message": f"No transcript found for call {call_sid}"
+        }, status_code=404)
 
 # Media Stream WebSocket Route
 @app.websocket('/media-stream')
@@ -176,11 +215,27 @@ async def handle_media_stream(websocket: WebSocket):
                         # Initialize the session with our configuration
                         await initialize_session(openai_ws)
                         stream_sid = None
+                        
+                        # Create shared state for the tasks
+                        state = {
+                            "user_speaking": False,
+                            "ai_speaking": False,
+                            "response_active": False,
+                            "buffer_size_warning": False,
+                            "last_audio_received": time.time(),
+                            "audio_accumulated": False,
+                            "connection_error_count": 0,
+                            "response_lock": asyncio.Lock()
+                        }
 
                         # Define the functions within this scope
                         async def receive_from_twilio():
                             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
                             nonlocal stream_sid
+                            nonlocal state
+                            audio_chunks_since_commit = 0
+                            last_forced_commit_time = time.time()
+                            
                             try:
                                 async for message in websocket.iter_text():
                                     try:
@@ -192,7 +247,7 @@ async def handle_media_stream(websocket: WebSocket):
                                             print(f"Incoming stream has started: {stream_sid}")
                                             
                                             # Send a welcome message to kick off the conversation
-                                            await send_initial_welcome(openai_ws)
+                                            await send_initial_welcome(openai_ws, state)
                                             
                                         elif data['event'] == 'media':
                                             # Send audio data to OpenAI
@@ -202,9 +257,18 @@ async def handle_media_stream(websocket: WebSocket):
                                                 
                                                 # Ensure we have valid base64 data (Twilio sends base64)
                                                 if audio_data:
-                                                    # Debug info about incoming audio
-                                                    if stream_sid and stream_sid[-4:] == "0000":  # Limit logging to avoid spam
-                                                        print(f"Received audio chunk, length: {len(audio_data)}")
+                                                    # Update state to track audio reception
+                                                    current_time = time.time()
+                                                    state["last_audio_received"] = current_time
+                                                    audio_chunks_since_commit += 1
+                                                    
+                                                    # Log every 100th audio chunk to confirm we're receiving audio
+                                                    if audio_chunks_since_commit % 100 == 0:
+                                                        print(f"Received {audio_chunks_since_commit} audio chunks so far")
+                                                    
+                                                    # Mark as accumulated if we've received enough chunks
+                                                    if audio_chunks_since_commit > 10:  # Increased to ensure sufficient audio data
+                                                        state["audio_accumulated"] = True
                                                     
                                                     # Only send if WebSocket is still open
                                                     if not openai_ws.closed:
@@ -214,6 +278,20 @@ async def handle_media_stream(websocket: WebSocket):
                                                             "audio": audio_data
                                                         }
                                                         await openai_ws.send_str(json.dumps(audio_append))
+                                                        
+                                                        # Only commit audio after we've accumulated a moderate amount
+                                                        # This balances between "buffer too small" errors and responsiveness
+                                                        if (audio_chunks_since_commit >= 20 and  # Increased to avoid buffer too small errors
+                                                            current_time - last_forced_commit_time >= 1.0 and  # Increased to ensure enough audio
+                                                            not state["buffer_size_warning"] and
+                                                            state["audio_accumulated"]):
+                                                            
+                                                            print(f"Force committing after {audio_chunks_since_commit} audio chunks")
+                                                            await openai_ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
+                                                            audio_chunks_since_commit = 0
+                                                            last_forced_commit_time = current_time
+                                                            state["audio_accumulated"] = False
+                                                            
                                                     else:
                                                         print("Cannot send audio - WebSocket is closed")
                                                         return  # Exit the function if connection is closed
@@ -240,16 +318,36 @@ async def handle_media_stream(websocket: WebSocket):
                         async def send_to_twilio():
                             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
                             nonlocal stream_sid
-                            user_speaking = False
-                            ai_speaking = False
-                            response_active = False  # Track if there's an active response
-                            buffer_size_warning = False  # Track if we've seen buffer size warnings
-                            connection_error_count = 0  # Track connection errors
+                            nonlocal state
+                            error_types_seen = set()
+                            last_ping_time = time.time()
                             
                             try:
                                 async for openai_message in openai_ws:
                                     if openai_message.type == aiohttp.WSMsgType.TEXT:
                                         response = json.loads(openai_message.data)
+                                        
+                                        # Send heartbeat with empty conversation item create every 15 seconds
+                                        current_time = time.time()
+                                        if current_time - last_ping_time > 15:
+                                            if not openai_ws.closed:
+                                                # Use a supported message type for keep-alive
+                                                keep_alive = {
+                                                    "type": "conversation.item.create",
+                                                    "item": {
+                                                        "type": "message",
+                                                        "role": "system",
+                                                        "content": [
+                                                            {
+                                                                "type": "input_text",
+                                                                "text": ""  # Empty text to minimize overhead
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                                await openai_ws.send_str(json.dumps(keep_alive))
+                                                last_ping_time = current_time
+                                                print("Sent heartbeat")
                                         
                                         # Log important events
                                         if response['type'] in LOG_EVENT_TYPES:
@@ -259,83 +357,101 @@ async def handle_media_stream(websocket: WebSocket):
                                             if response['type'] == 'error':
                                                 error_details = response.get('error', {})
                                                 print(f"ERROR DETAILS: {json.dumps(error_details)}")
+                                                error_code = error_details.get('code', '')
+                                                error_types_seen.add(error_code)
+                                                print(f"Error types seen so far: {error_types_seen}")
                                                 
-                                                # Handle specific error types
+                                                # Enhanced error handling
                                                 error_message = error_details.get('message', '')
-                                                if 'buffer too small' in error_message:
-                                                    buffer_size_warning = True
-                                                    # Don't try to commit again right away
-                                                    continue
-                                                elif 'already has an active response' in error_message:
-                                                    response_active = True
-                                                    # Don't try to create another response
-                                                    continue
+                                                if 'buffer too small' in error_message or error_code == 'input_audio_buffer_commit_empty':
+                                                    state["buffer_size_warning"] = True
+                                                    print("Skipping buffer commit due to small buffer size")
+                                                    # Reset audio tracking to force more accumulation
+                                                    state["audio_accumulated"] = False
+                                                elif 'already has an active response' in error_message or error_code == 'conversation_already_has_active_response':
+                                                    state["response_active"] = True
+                                                    print("Skipping response creation - response already active")
                                         
                                         # Update response state tracking
                                         if response['type'] == 'response.created':
-                                            response_active = True
-                                            connection_error_count = 0  # Reset error count on successful events
-                                        elif response['type'] == 'response.done':
-                                            response_active = False
-                                            # Clear buffer size warning after response completes
-                                            buffer_size_warning = False
-                                            connection_error_count = 0  # Reset error count on successful events
+                                            async with state["response_lock"]:
+                                                state["response_active"] = True
+                                            state["connection_error_count"] = 0  # Reset error count
+                                            print("*** RESPONSE CREATED - LLM is generating a response ***")
                                         
-                                        # Handle speech events
+                                        elif response['type'] == 'response.done':
+                                            async with state["response_lock"]:
+                                                state["response_active"] = False
+                                                state["buffer_size_warning"] = False  # Reset buffer warning when response is done
+                                            state["connection_error_count"] = 0  # Reset error count
+                                            print("*** RESPONSE DONE - LLM finished responding ***")
+                                        
+                                        # Handle speech events with improved error recovery
                                         if response['type'] == 'input_audio_buffer.speech_started':
-                                            print("User started speaking")
-                                            user_speaking = True
-                                            # Reset buffer warning when user starts speaking
-                                            buffer_size_warning = False
-                                            connection_error_count = 0  # Reset error count on successful events
+                                            print("*** USER STARTED SPEAKING - Audio detected ***")
+                                            state["user_speaking"] = True
+                                            state["audio_accumulated"] = True  # Mark as accumulated when speech detected
+                                            state["buffer_size_warning"] = False  # Reset buffer warning when speech starts
+                                            state["connection_error_count"] = 0
                                             
                                         elif response['type'] == 'input_audio_buffer.speech_stopped':
-                                            print("User stopped speaking")
-                                            user_speaking = False
+                                            print("*** USER STOPPED SPEAKING - Silence detected ***")
+                                            state["user_speaking"] = False
                                             
-                                            # After speech stops, commit the buffer only if there's not an active response
-                                            if not response_active and not buffer_size_warning:
-                                                print("Committing audio buffer...")
-                                                if not openai_ws.closed:
-                                                    # Longer delay to accumulate more audio for the minimum buffer size
-                                                    await asyncio.sleep(0.5)  # Increased from 0.2 to 0.5
-                                                    await openai_ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
-                                                    # Longer wait before creating response
-                                                    await asyncio.sleep(0.8)  # Increased from 0.2 to 0.8
-                                                    if not response_active and not openai_ws.closed:
-                                                        print("Creating response...")
-                                                        await openai_ws.send_str(json.dumps({"type": "response.create"}))
-                                                else:
-                                                    print("Cannot commit buffer - WebSocket is closed")
-                                                    return
+                                            # Wait a bit before committing to avoid buffer too small errors
+                                            await asyncio.sleep(0.2)
+                                            
+                                            # Explicitly commit the audio buffer when speech stops
+                                            # This ensures the LLM gets the complete utterance
+                                            if not openai_ws.closed and not state["response_active"] and not state["buffer_size_warning"]:
+                                                print("*** COMMITTING AUDIO AFTER SPEECH ***")
+                                                await openai_ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
                                         
-                                        # If we get a successful buffer commit, we might want to create a response
+                                        # If we get a successful buffer commit, log it prominently
                                         elif response['type'] == 'input_audio_buffer.committed':
-                                            print("Audio buffer committed")
-                                            connection_error_count = 0  # Reset error count on successful events
-                                            buffer_size_warning = False  # Reset buffer warning on successful commit
+                                            print("*** AUDIO BUFFER COMMITTED SUCCESSFULLY ***")
+                                            state["buffer_size_warning"] = False
+                                            state["connection_error_count"] = 0
+                                            state["audio_accumulated"] = False
                                             
-                                            # Only create a response if one isn't already active and conditions are right
-                                            if not response_active and not user_speaking and not ai_speaking:
-                                                # Much longer delay to avoid race conditions and give user time to speak
-                                                await asyncio.sleep(1.0)  # Increased from 0.3 to 1.0
-                                                if not openai_ws.closed:
-                                                    print("Creating response after commit...")
-                                                    await openai_ws.send_str(json.dumps({"type": "response.create"}))
-                                                else:
-                                                    print("Cannot create response - WebSocket is closed")
-                                                    return
+                                            # Wait a moment before creating a response to ensure system stability
+                                            await asyncio.sleep(0.2)
+                                            
+                                            # Explicitly create a response after successful commit
+                                            # This ensures the LLM responds to the committed audio
+                                            if not openai_ws.closed and not state["response_active"]:
+                                                print("*** CREATING RESPONSE AFTER SUCCESSFUL COMMIT ***")
+                                                await openai_ws.send_str(json.dumps({"type": "response.create"}))
                                         
                                         # Handle turn events
                                         elif response['type'] == 'turn.started':
                                             turn = response.get('turn', {})
                                             if turn.get('role') == 'assistant':
-                                                ai_speaking = True
+                                                state["ai_speaking"] = True
+                                                print("*** AI STARTED SPEAKING ***")
                                                 
-                                        elif response['type'] == 'turn.finalized':
-                                            turn = response.get('turn', {})
-                                            if turn.get('role') == 'assistant':
-                                                ai_speaking = False
+                                            elif response['type'] == 'turn.finalized':
+                                                turn = response.get('turn', {})
+                                                if turn.get('role') == 'assistant':
+                                                    state["ai_speaking"] = False
+                                                    print("*** AI FINISHED SPEAKING ***")
+                                                elif turn.get('role') == 'user':
+                                                    # Log user transcription prominently
+                                                    user_text = None
+                                                    for content_item in turn.get('content', []):
+                                                        if content_item.get('type') == 'text':
+                                                            user_text = content_item.get('text', '')
+                                                            break
+                                                    
+                                                    if user_text:
+                                                        print(f"*** USER SAID: '{user_text}' ***")
+                                                        # Store user transcription
+                                                        if stream_sid and stream_sid in CALL_TRANSCRIPTS:
+                                                            CALL_TRANSCRIPTS[stream_sid].append({
+                                                                "role": "user",
+                                                                "text": user_text,
+                                                                "timestamp": time.time()
+                                                            })
                                         
                                         # Send audio back to Twilio
                                         elif response['type'] == 'response.audio.delta' and response.get('delta') and stream_sid:
@@ -356,10 +472,25 @@ async def handle_media_stream(websocket: WebSocket):
                                                     return
                                             except Exception as e:
                                                 print(f"Error processing audio: {e}")
-                                                connection_error_count += 1
-                                                if connection_error_count > 5:
+                                                state["connection_error_count"] += 1
+                                                if state["connection_error_count"] > 5:
                                                     print("Too many audio processing errors, closing connection")
                                                     return
+                                        
+                                        # Handle transcription events
+                                        if response['type'] == 'response.content.delta' and 'delta' in response and 'content' in response['delta']:
+                                            content = response['delta']['content']
+                                            if 'text' in content:
+                                                text = content['text']
+                                                print(f"*** AI TRANSCRIPTION: '{text}' ***")
+                                                
+                                                # Store the transcription
+                                                if stream_sid and stream_sid in CALL_TRANSCRIPTS:
+                                                    CALL_TRANSCRIPTS[stream_sid].append({
+                                                        "role": "assistant",
+                                                        "text": text,
+                                                        "timestamp": time.time()
+                                                    })
                                     
                                     elif openai_message.type == aiohttp.WSMsgType.ERROR:
                                         print(f"WebSocket error: {openai_message.data}")
@@ -374,6 +505,9 @@ async def handle_media_stream(websocket: WebSocket):
                             except Exception as e:
                                 print(f"Error in send_to_twilio: {e}")
                         
+                        # Start a background task to periodically check and commit audio
+                        background_task = asyncio.create_task(periodic_check(openai_ws, state))
+                        
                         # Handle bidirectional data flow
                         tasks = [
                             receive_from_twilio(),
@@ -382,6 +516,8 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Run both tasks concurrently
                         await asyncio.gather(*tasks)
+                        # Cancel the background task
+                        background_task.cancel()
                         break  # Exit the retry loop if everything was successful
                         
             except aiohttp.ClientConnectorError as e:
@@ -448,50 +584,196 @@ async def initialize_session(openai_ws):
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "silence_duration_ms": 2000,     # Increased from 1000ms to 2000ms for longer natural pauses
-                "prefix_padding_ms": 500,        # Increased from 300ms to 500ms to keep more audio context before speech
-                "threshold": 0.5,                # Reduced threshold to better detect subtle speech
-                "create_response": True,         # Auto create response on speech end
-                "interrupt_response": True       # Allow interrupting AI's response
+                "silence_duration_ms": 600,     # Increased to allow more time to detect end of speech
+                "prefix_padding_ms": 200,       # Increased to capture more of the beginning of speech
+                "threshold": 0.2,               # Lowered threshold to detect speech more sensitively
+                "create_response": True,        # Automatically create response when speech is detected
+                "interrupt_response": True      # Allow interrupting AI's response
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE,
-            "modalities": ["text", "audio"],
-            "temperature": 0.8,
+            "instructions": SYSTEM_MESSAGE + "\n\nIMPORTANT: ALWAYS LISTEN CAREFULLY TO THE PERSON YOU'RE TALKING TO AND RESPOND DIRECTLY TO WHAT THEY SAY. DO NOT JUST RECITE A SCRIPT. ENGAGE IN A REAL CONVERSATION.",
+            "modalities": ["text", "audio"],   # Include both text and audio modalities
+            "temperature": 0.9,                # Increased for more dynamic responses
         }
     }
     print('Sending session update:', json.dumps(session_update))
     
+    # Convert Python objects to JSON-compatible format
+    json_string = json.dumps(session_update)
+    
     # Use send_str for aiohttp websocket
-    await openai_ws.send_str(json.dumps(session_update))
+    await openai_ws.send_str(json_string)
 
-    # The line below was removed to prevent the AI from speaking first
-    # await send_initial_conversation_item(openai_ws)
-
-async def send_initial_conversation_item(openai_ws):
-    """Send initial conversation so AI talks first."""
-    initial_conversation_item = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": (
-                        "Greet the user with 'Hello there! I am an AI voice assistant powered by "
-                        "Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or "
-                        "anything you can imagine. How can I help you?'"
-                    )
-                }
-            ]
-        }
-    }
-    # Use send_str for aiohttp websocket
-    await openai_ws.send_str(json.dumps(initial_conversation_item))
+# New helper function for creating responses with proper locking
+async def create_response(openai_ws, state):
+    """Create a response with proper locking to avoid conflicts."""
+    async with state["response_lock"]:
+        if state["response_active"]:
+            print("Response already active, skipping creation")
+            return
+        
+        # Mark response as active before creating
+        state["response_active"] = True
+        
+    print("Creating response with lock...")
     await openai_ws.send_str(json.dumps({"type": "response.create"}))
+
+async def send_initial_welcome(openai_ws, state):
+    """Send a welcome message to initiate the conversation."""
+    try:
+        # Check if WebSocket is still open
+        if openai_ws.closed:
+            print("Cannot send welcome message - WebSocket is closed")
+            return
+        
+        # Wait to ensure connection is fully established
+        await asyncio.sleep(1.0)  # Increased to ensure full connection
+            
+        # Create a short greeting message to start the conversation
+        initial_message = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user", 
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Hello there."  # Simple greeting
+                    }
+                ]
+            }
+        }
+        
+        # Send the initial message if the connection is still open
+        if not openai_ws.closed:
+            await openai_ws.send_str(json.dumps(initial_message))
+            print("*** SENT INITIAL WELCOME MESSAGE ***")
+            
+            # Wait before creating a response
+            await asyncio.sleep(1.0)  # Increased to ensure proper timing
+            
+            # Explicitly create a response to start the conversation
+            if not openai_ws.closed:
+                print("*** CREATING INITIAL RESPONSE ***")
+                await openai_ws.send_str(json.dumps({"type": "response.create"}))
+        else:
+            print("Cannot send initial message - WebSocket closed during delay")
+    
+    except aiohttp.ClientError as e:
+        print(f"WebSocket connection error in welcome message: {e}")
+    except Exception as e:
+        print(f"Error sending welcome message: {e}")
+
+# New periodic check function with improved audio handling
+async def periodic_check(openai_ws, state):
+    """Periodically check and commit audio if needed."""
+    try:
+        # Wait for initial conversation to establish
+        await asyncio.sleep(3)  # Increased to ensure initial welcome completes
+        
+        last_commit_time = time.time()
+        last_ping_time = time.time()
+        last_error_time = 0
+        ping_count = 0
+        
+        while not openai_ws.closed:
+            try:
+                # Check less frequently to avoid overloading
+                await asyncio.sleep(2)  # Increased to reduce frequency of checks
+                
+                # Exit if WebSocket is closed
+                if openai_ws.closed:
+                    print("Periodic check: WebSocket closed, exiting task")
+                    return
+                
+                current_time = time.time()
+                
+                # Send a heartbeat to keep connection alive (every 20 seconds)
+                if current_time - last_ping_time >= 20:  # Increased interval
+                    if not openai_ws.closed:
+                        # Use a supported message type for keep-alive
+                        keep_alive = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "system",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": ""  # Empty text to minimize overhead
+                                    }
+                                ]
+                            }
+                        }
+                        await openai_ws.send_str(json.dumps(keep_alive))
+                        print("Sent periodic heartbeat")
+                        last_ping_time = current_time
+                
+                # Only attempt commits if it's been a while since last commit and we're not speaking
+                if (current_time - last_commit_time >= 8 and  # Increased to reduce frequency
+                    current_time - last_error_time >= 5 and   # Increased to allow more recovery time
+                    not state["user_speaking"] and 
+                    not state["ai_speaking"]):
+                    
+                    # Verify no active response before trying to commit
+                    async with state["response_lock"]:
+                        should_proceed = not state["response_active"] and not state["buffer_size_warning"]
+                    
+                    if should_proceed:
+                        print(f"Periodic check: sending audio ping #{ping_count + 1}")
+                        
+                        # Send a minimal message to check for audio - make it more substantial
+                        ping_message = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "system",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "........................"  # More data to ensure we have enough
+                                    }
+                                ]
+                            }
+                        }
+                        
+                        try:
+                            if not openai_ws.closed:
+                                # First send the ping message
+                                await openai_ws.send_str(json.dumps(ping_message))
+                                
+                                # Wait longer to accumulate audio
+                                await asyncio.sleep(1.0)  # Increased to ensure we have enough audio
+                                
+                                # Only commit if we still don't have an active response
+                                async with state["response_lock"]:
+                                    should_commit = not state["response_active"]
+                                
+                                if should_commit and not openai_ws.closed:
+                                    print(f"Committing ping audio #{ping_count + 1}")
+                                    await openai_ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
+                                    last_commit_time = current_time
+                                    ping_count += 1
+                            else:
+                                print("Periodic check: WebSocket closed")
+                                return
+                        except Exception as e:
+                            print(f"Error in periodic ping: {e}")
+                            last_error_time = current_time
+                
+            except asyncio.CancelledError:
+                print("Periodic check task cancelled")
+                return
+            except Exception as e:
+                print(f"Error in periodic check: {e}")
+                last_error_time = current_time
+                
+    except asyncio.CancelledError:
+        print("Periodic check task cancelled")
+    except Exception as e:
+        print(f"Error in periodic check: {e}")
 
 async def check_number_allowed(to):
     """Check if a number is allowed to be called."""
@@ -519,7 +801,7 @@ async def check_number_allowed(to):
         print(f"Error checking phone number: {e}")
         return False
     """
-async def make_call(phone_number_to_call: str):
+async def make_call(phone_number_to_call: str, record_call: bool = False):
     """Make an outbound call."""
     if not phone_number_to_call:
         raise ValueError("Please provide a phone number to call.")
@@ -537,160 +819,27 @@ async def make_call(phone_number_to_call: str):
         f'<Response><Connect><Stream url="wss://{DOMAIN}/media-stream" /></Connect></Response>'
     )
 
-    call = client.calls.create(
-        from_=PHONE_NUMBER_FROM,
-        to=phone_number_to_call,
-        twiml=outbound_twiml
-    )
+    # Create the call with optional recording
+    call_params = {
+        'from_': PHONE_NUMBER_FROM,
+        'to': phone_number_to_call,
+        'twiml': outbound_twiml,
+    }
+    
+    # Add recording parameters if enabled
+    if record_call:
+        call_params['record'] = True
+        # Optionally set recording status callback
+        # call_params['recordingStatusCallback'] = f"https://{DOMAIN}/recording-status"
+    
+    call = client.calls.create(**call_params)
 
     await log_call_sid(call.sid)
+    return call.sid  # Return the call SID for transcript association
 
 async def log_call_sid(call_sid):
     """Log the call SID."""
     print(f"Call started with SID: {call_sid}")
-
-async def send_initial_welcome(openai_ws):
-    """Send a welcome message to initiate the conversation."""
-    try:
-        # Check if WebSocket is still open
-        if openai_ws.closed:
-            print("Cannot send welcome message - WebSocket is closed")
-            return
-        
-        # First wait to ensure connection is fully established
-        await asyncio.sleep(2.0)  # Increased from 1.0 to 2.0 seconds
-            
-        # Create a natural greeting message to start the conversation
-        initial_message = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user", 
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "Hello, I'd like to speak with you."
-                    }
-                ]
-            }
-        }
-        
-        # Send the initial message if the connection is still open
-        if not openai_ws.closed:
-            await openai_ws.send_str(json.dumps(initial_message))
-            
-            # Wait a moment before creating a response - longer delay for stability
-            await asyncio.sleep(2.0)  # Increased from 1.0 to 2.0 seconds
-            
-            # Check if WebSocket is still open before creating response
-            if not openai_ws.closed:
-                # Create a response to this initial message
-                await openai_ws.send_str(json.dumps({"type": "response.create"}))
-                print("Sent initial welcome message")
-                
-                # Wait a moment before starting the periodic check
-                await asyncio.sleep(2.0)  # Increased from 1.0 to 2.0 seconds
-                
-                # Start a background task to periodically commit audio if no speech is detected
-                if not openai_ws.closed:
-                    asyncio.create_task(periodic_commit_check(openai_ws))
-                else:
-                    print("Cannot start periodic check - WebSocket is closed")
-            else:
-                print("Cannot create welcome response - WebSocket is closed")
-        else:
-            print("Cannot send initial message - WebSocket closed during delay")
-    
-    except aiohttp.ClientError as e:
-        print(f"WebSocket connection error in welcome message: {e}")
-    except Exception as e:
-        print(f"Error sending welcome message: {e}")
-
-async def periodic_commit_check(openai_ws):
-    """Periodically check and commit audio if needed."""
-    try:
-        # Wait for initial conversation to establish
-        await asyncio.sleep(20)  # Increased initial wait time from 15 to 20 seconds
-        
-        last_commit_time = time.time()
-        last_error_time = 0
-        
-        while not openai_ws.closed:
-            try:
-                # Check less frequently - every 8 seconds instead of 5
-                await asyncio.sleep(8)
-                
-                # Exit if WebSocket is closed
-                if openai_ws.closed:
-                    print("Periodic check: WebSocket closed, exiting periodic commit task")
-                    return
-                
-                current_time = time.time()
-                
-                # Only commit if it's been at least 20 seconds since last commit (increased from 15)
-                # and at least 15 seconds since the last error (increased from 10)
-                if (current_time - last_commit_time >= 20 and 
-                    current_time - last_error_time >= 15):
-                    
-                    print("Periodic check: manually committing audio buffer")
-                    
-                    # Send a small ping message to make sure we have some audio data
-                    ping_message = {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": "..." # Small non-disruptive ping
-                                }
-                            ]
-                        }
-                    }
-                    
-                    # First try a commit
-                    try:
-                        # Check again if the WebSocket is still open
-                        if not openai_ws.closed:
-                            # First send the ping message to ensure we have data
-                            await openai_ws.send_str(json.dumps(ping_message))
-                            # Wait longer for the message to be processed and buffer to be populated
-                            await asyncio.sleep(1.5)  # Increased from 1.0 to 1.5 seconds
-                            
-                            # Now commit the buffer
-                            await openai_ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
-                            last_commit_time = current_time
-                            
-                            # Wait a longer time before creating response
-                            await asyncio.sleep(1.5)  # Increased from 0.5 to 1.5 seconds
-                            
-                            # Only create response if we haven't received any errors
-                            if current_time - last_error_time >= 15 and not openai_ws.closed:  # Increased from 10 to 15
-                                await openai_ws.send_str(json.dumps({"type": "response.create"}))
-                        else:
-                            print("Periodic check: WebSocket closed, exiting periodic commit task")
-                            return
-                    except aiohttp.ClientError as e:
-                        print(f"WebSocket connection error in periodic commit: {e}")
-                        last_error_time = current_time
-                        return  # Exit on WebSocket errors
-                    except Exception as e:
-                        print(f"Error in periodic commit: {e}")
-                        last_error_time = current_time
-                    
-            except asyncio.CancelledError:
-                print("Periodic commit task cancelled")
-                return
-            except Exception as e:
-                print(f"Error in periodic commit: {e}")
-                last_error_time = time.time()
-                await asyncio.sleep(8)  # Back off on errors
-                
-    except asyncio.CancelledError:
-        print("Periodic commit task cancelled")
-    except Exception as e:
-        print(f"Error in periodic commit task: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Twilio AI voice assistant server.")
@@ -707,6 +856,7 @@ if __name__ == "__main__":
     if args.call:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(make_call(args.call))
+    # Removed auto-calling of default number
     
     # Start the web server
     print(f"Starting server on port {PORT}. Access the web UI at http://localhost:{PORT}")
